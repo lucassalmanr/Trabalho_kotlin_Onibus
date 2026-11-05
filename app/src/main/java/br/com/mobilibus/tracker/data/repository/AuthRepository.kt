@@ -6,6 +6,7 @@ import br.com.mobilibus.tracker.data.local.UserEntity
 import br.com.mobilibus.tracker.domain.repository.AuthRepository
 import java.security.MessageDigest
 
+
 class RoomAuthRepository(
     private val users: UserDao,
     private val session: SessionStore
@@ -26,7 +27,10 @@ class RoomAuthRepository(
         session.saveUser(user.id)
     }
 
-    override suspend fun logout() = session.clear()
+    override suspend fun logout() {
+        session.clear()
+    }
+
 
     private fun String.sha256(): String = MessageDigest.getInstance("SHA-256")
         .digest(toByteArray())

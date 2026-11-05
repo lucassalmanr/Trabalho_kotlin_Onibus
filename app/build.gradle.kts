@@ -9,6 +9,7 @@ plugins {
 android {
     namespace = "br.com.mobilibus.tracker"
     compileSdk = 35
+    buildToolsVersion = "35.0.0"
 
     defaultConfig {
         applicationId = "br.com.mobilibus.tracker"

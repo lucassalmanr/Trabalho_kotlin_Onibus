@@ -1,5 +1,4 @@
 package br.com.mobilibus.tracker.ui
-
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -73,6 +72,7 @@ import java.util.Date
 @Serializable data object AccountTab
 @Serializable data class VehicleDetail(val vehicleId: String)
 
+
 @Composable
 fun MobilibusApp(graph: AppGraph) {
     val userId by graph.session.userId.collectAsStateWithLifecycle(initialValue = null)
@@ -120,6 +120,7 @@ private fun AuthScreen(viewModel: AuthViewModel) {
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun TrackerScreen(userId: Long, viewModel: TrackerViewModel, onLogout: () -> Unit) {
     val nav = rememberNavController()
@@ -206,7 +207,7 @@ private fun VehicleListScreen(
         }
     }
 }
-
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun FavoritesScreen(favorites: List<FavoriteVehicle>, favoriteIds: Set<String>, open: (String) -> Unit) {
     Scaffold(topBar = { CenterAlignedTopAppBar(title = { Text("Veículos salvos") }) }) { padding ->
@@ -222,6 +223,7 @@ private fun FavoritesScreen(favorites: List<FavoriteVehicle>, favoriteIds: Set<S
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun AccountScreen(userId: Long, onLogout: () -> Unit) {
     Scaffold(topBar = { CenterAlignedTopAppBar(title = { Text("Minha conta") }) }) { padding ->

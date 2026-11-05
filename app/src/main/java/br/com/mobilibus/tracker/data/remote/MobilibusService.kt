@@ -47,7 +47,8 @@ object ProtoVehicleDecoder {
         .distinctBy { it.id }
 
     private fun decodeEntry(bytes: ByteArray): Vehicle? {
-        val entry = ProtoReader(bytes).fields
+        // CORREÇÃO: entry agora mantém a instância de ProtoReader para usar as funções customizadas
+        val entry = ProtoReader(bytes)
         val id = entry.string(1).orEmpty()
         val payload = entry.message(2) ?: return null
         val label = payload.string(1).orEmpty().ifBlank { id }
@@ -97,9 +98,9 @@ object ProtoVehicleDecoder {
                     5 -> {
                         if (offset + 4 > source.size) break
                         val value = (source[offset].toInt() and 0xff) or
-                            ((source[offset + 1].toInt() and 0xff) shl 8) or
-                            ((source[offset + 2].toInt() and 0xff) shl 16) or
-                            ((source[offset + 3].toInt() and 0xff) shl 24)
+                                ((source[offset + 1].toInt() and 0xff) shl 8) or
+                                ((source[offset + 2].toInt() and 0xff) shl 16) or
+                                ((source[offset + 3].toInt() and 0xff) shl 24)
                         add(Field(number, fixed32 = value)); offset += 4
                     }
                     else -> break
