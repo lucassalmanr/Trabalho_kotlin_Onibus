@@ -1,5 +1,14 @@
+@file:Suppress("MissingPermission")
+
 package br.com.mobilibus.tracker.ui
 
+import android.Manifest
+import android.content.Context
+import android.content.pm.PackageManager
+import android.location.Location
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -23,9 +32,11 @@ import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.FavoriteBorder
 import androidx.compose.material.icons.filled.LocationOn
 import androidx.compose.material.icons.filled.Logout
+import androidx.compose.material.icons.filled.MyLocation
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.Button
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CenterAlignedTopAppBar
@@ -44,12 +55,16 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
@@ -65,10 +80,25 @@ import br.com.mobilibus.tracker.AppGraph
 import br.com.mobilibus.tracker.domain.model.FavoriteVehicle
 import br.com.mobilibus.tracker.domain.model.Vehicle
 import kotlinx.serialization.Serializable
+import com.google.android.gms.location.LocationServices
+import com.google.android.gms.location.Priority
+import com.google.android.gms.tasks.CancellationTokenSource
+import com.google.maps.android.compose.GoogleMap
+import com.google.maps.android.compose.MapProperties
+import com.google.maps.android.compose.MapUiSettings
+import com.google.maps.android.compose.Marker
+import com.google.maps.android.compose.MarkerState
+import com.google.maps.android.compose.rememberCameraPositionState
+import com.google.android.gms.maps.CameraUpdateFactory
+import com.google.android.gms.maps.model.BitmapDescriptorFactory
+import com.google.android.gms.maps.model.CameraPosition
+import com.google.android.gms.maps.model.LatLng
+import kotlinx.coroutines.delay
 import java.text.DateFormat
 import java.util.Date
 
 @Serializable data object VehiclesTab
+@Serializable data object MapTab
 @Serializable data object FavoritesTab
 @Serializable data object AccountTab
 @Serializable data class VehicleDetail(val vehicleId: String)
@@ -136,6 +166,9 @@ private fun TrackerScreen(userId: Long, viewModel: TrackerViewModel, onLogout: (
                     viewModel.toggleFavorite(vehicle, favorite)
                 }) { nav.navigate(VehicleDetail(it.id)) }
             }
+            composable<MapTab> {
+                MapScreen(feed = feed, favoriteIds = favoriteIds, refresh = viewModel::refresh)
+            }
             composable<FavoritesTab> {
                 FavoritesScreen(favorites, favoriteIds) { nav.navigate(VehicleDetail(it)) }
             }
@@ -164,8 +197,157 @@ private fun BottomTabs(nav: NavHostController) {
     val route = current?.destination?.route.orEmpty()
     NavigationBar {
         NavigationBarItem(route.contains("VehiclesTab"), { nav.navigate(VehiclesTab) { launchSingleTop = true } }, { Icon(Icons.Default.DirectionsBus, "Veículos") }, label = { Text("Veículos") })
+        NavigationBarItem(route.contains("MapTab"), { nav.navigate(MapTab) { launchSingleTop = true } }, { Icon(Icons.Default.LocationOn, "Mapa") }, label = { Text("Mapa") })
         NavigationBarItem(route.contains("FavoritesTab"), { nav.navigate(FavoritesTab) { launchSingleTop = true } }, { Icon(Icons.Default.Favorite, "Salvos") }, label = { Text("Salvos") })
         NavigationBarItem(route.contains("AccountTab"), { nav.navigate(AccountTab) { launchSingleTop = true } }, { Icon(Icons.Default.Person, "Conta") }, label = { Text("Conta") })
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun MapScreen(feed: FeedUiState, favoriteIds: Set<String>, refresh: () -> Unit) {
+    val context = LocalContext.current
+    val locationClient = remember { LocationServices.getFusedLocationProviderClient(context) }
+    val defaultCenter = remember { LatLng(-19.9167, -43.9345) }
+    val camera = rememberCameraPositionState {
+        position = CameraPosition.fromLatLngZoom(defaultCenter, 12f)
+    }
+    var cachedFeed by remember { mutableStateOf<FeedUiState.Success?>(null) }
+    var selectedVehicle by remember { mutableStateOf<Vehicle?>(null) }
+    var userLocation by remember { mutableStateOf<LatLng?>(null) }
+    var locationMessage by remember { mutableStateOf<String?>(null) }
+    var showLocationRationale by remember { mutableStateOf(false) }
+    var initialCameraSet by remember { mutableStateOf(false) }
+    var activeLocationRequest by remember { mutableStateOf<CancellationTokenSource?>(null) }
+
+    DisposableEffect(Unit) {
+        onDispose { activeLocationRequest?.cancel() }
+    }
+
+    val permissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { grants ->
+        if (grants[Manifest.permission.ACCESS_COARSE_LOCATION] == true ||
+            grants[Manifest.permission.ACCESS_FINE_LOCATION] == true
+        ) {
+            activeLocationRequest = requestDeviceLocation(locationClient, onLocation = { location ->
+                userLocation = location.toLatLng()
+                camera.move(CameraUpdateFactory.newLatLngZoom(userLocation!!, 15f))
+                locationMessage = null
+            }, onUnavailable = { locationMessage = it })
+        } else {
+            locationMessage = "A localização foi negada. Você ainda pode acompanhar os ônibus no mapa."
+        }
+    }
+
+    LaunchedEffect(feed, favoriteIds) {
+        if (feed is FeedUiState.Success) {
+            cachedFeed = feed
+            if (!initialCameraSet) {
+                feed.vehicles.firstOrNull {
+                    it.id in favoriteIds && it.latitude != null && it.longitude != null
+                }?.let { vehicle ->
+                    camera.move(CameraUpdateFactory.newLatLngZoom(vehicle.toLatLng(), 12f))
+                    initialCameraSet = true
+                }
+            }
+        }
+    }
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(30_000)
+            refresh()
+        }
+    }
+
+    val visibleFeed = cachedFeed
+    val hasLocationPermission = context.hasLocationPermission()
+    val vehicles = visibleFeed?.vehicles.orEmpty().filter {
+        it.id in favoriteIds && it.latitude != null && it.longitude != null
+    }
+
+    if (showLocationRationale) {
+        AlertDialog(
+            onDismissRequest = { showLocationRationale = false },
+            title = { Text("Mostrar sua localização") },
+            text = { Text("Usaremos sua localização apenas enquanto esta tela estiver aberta para centralizar o mapa. Ela não é armazenada nem usada em segundo plano.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    showLocationRationale = false
+                    permissionLauncher.launch(arrayOf(Manifest.permission.ACCESS_COARSE_LOCATION, Manifest.permission.ACCESS_FINE_LOCATION))
+                }) { Text("Permitir") }
+            },
+            dismissButton = { TextButton(onClick = { showLocationRationale = false }) { Text("Agora não") } }
+        )
+    }
+
+    Scaffold(topBar = {
+        CenterAlignedTopAppBar(
+            title = { Text("Mapa ao vivo") },
+            actions = { IconButton(onClick = refresh) { Icon(Icons.Default.Refresh, "Atualizar mapa") } }
+        )
+    }) { padding ->
+        Box(Modifier.fillMaxSize().padding(padding)) {
+            GoogleMap(
+                modifier = Modifier.fillMaxSize(),
+                cameraPositionState = camera,
+                properties = MapProperties(isMyLocationEnabled = hasLocationPermission && userLocation != null),
+                uiSettings = MapUiSettings(myLocationButtonEnabled = false)
+            ) {
+                vehicles.forEach { vehicle ->
+                    Marker(
+                        state = MarkerState(position = vehicle.toLatLng()),
+                        title = "Linha ${vehicle.line}",
+                        snippet = vehicle.label,
+                        icon = BitmapDescriptorFactory.defaultMarker(
+                            if (vehicle.isStale()) BitmapDescriptorFactory.HUE_ORANGE else BitmapDescriptorFactory.HUE_AZURE
+                        ),
+                        onClick = { _ -> selectedVehicle = vehicle; true }
+                    )
+                }
+            }
+
+            IconButton(
+                onClick = {
+                    if (hasLocationPermission) {
+                        activeLocationRequest = requestDeviceLocation(locationClient, onLocation = { location ->
+                            userLocation = location.toLatLng()
+                            camera.move(CameraUpdateFactory.newLatLngZoom(userLocation!!, 15f))
+                            locationMessage = null
+                        }, onUnavailable = { locationMessage = it })
+                    } else showLocationRationale = true
+                },
+                modifier = Modifier.align(Alignment.TopEnd).padding(16.dp).background(MaterialTheme.colorScheme.surface, RoundedCornerShape(24.dp))
+            ) { Icon(Icons.Default.MyLocation, "Centralizar na minha localização") }
+
+            Column(
+                modifier = Modifier.align(Alignment.TopStart).padding(16.dp).background(MaterialTheme.colorScheme.surface.copy(alpha = .92f), RoundedCornerShape(12.dp)).padding(12.dp)
+            ) {
+                when {
+                    favoriteIds.isEmpty() -> Text("Salve um ônibus para vê-lo no mapa")
+                    visibleFeed == null && feed is FeedUiState.Loading -> Text("Carregando veículos...")
+                    visibleFeed == null && feed is FeedUiState.Error -> Text("Não foi possível carregar o mapa. Toque em atualizar.", color = MaterialTheme.colorScheme.error)
+                    vehicles.isEmpty() -> Text("Nenhum ônibus salvo com posição disponível.")
+                    else -> Text("${vehicles.size} ônibus no mapa")
+                }
+                Text("Azul: atualizado • Laranja: desatualizado", style = MaterialTheme.typography.labelSmall)
+                locationMessage?.let { Text(it, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.error) }
+            }
+
+            selectedVehicle?.takeIf { selected -> vehicles.any { it.id == selected.id } }?.let { vehicle ->
+                Card(
+                    modifier = Modifier.align(Alignment.BottomCenter).padding(16.dp).fillMaxWidth(),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+                ) {
+                    Column(Modifier.padding(16.dp)) {
+                        Text("Linha ${vehicle.line}", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                        Text(vehicle.label)
+                        Text(vehicle.destination, style = MaterialTheme.typography.bodySmall)
+                        Text(vehicle.lastUpdatedText(), style = MaterialTheme.typography.bodySmall, color = if (vehicle.isStale()) MaterialTheme.colorScheme.error else Color.Unspecified)
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -207,6 +389,7 @@ private fun VehicleListScreen(
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun FavoritesScreen(favorites: List<FavoriteVehicle>, favoriteIds: Set<String>, open: (String) -> Unit) {
     Scaffold(topBar = { CenterAlignedTopAppBar(title = { Text("Veículos salvos") }) }) { padding ->
@@ -222,6 +405,7 @@ private fun FavoritesScreen(favorites: List<FavoriteVehicle>, favoriteIds: Set<S
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun AccountScreen(userId: Long, onLogout: () -> Unit) {
     Scaffold(topBar = { CenterAlignedTopAppBar(title = { Text("Minha conta") }) }) { padding ->
@@ -298,3 +482,39 @@ private fun ErrorPane(message: String, retry: () -> Unit, modifier: Modifier = M
 
 private fun FavoriteVehicle.asVehicle() = Vehicle(vehicleId, label, line, destination, latitude, longitude, null, null)
 private fun Vehicle.coordinatesText() = if (latitude != null && longitude != null) "${"%.5f".format(latitude)}, ${"%.5f".format(longitude)}" else "Localização não informada"
+
+private fun Vehicle.toLatLng() = LatLng(requireNotNull(latitude), requireNotNull(longitude))
+
+private fun Vehicle.isStale(now: Long = System.currentTimeMillis()): Boolean {
+    val vehicleTimestamp = timestamp ?: return true
+    val millis = if (vehicleTimestamp < 100_000_000_000L) vehicleTimestamp * 1_000 else vehicleTimestamp
+    return now - millis > 5 * 60 * 1_000
+}
+
+private fun Vehicle.lastUpdatedText(): String {
+    val vehicleTimestamp = timestamp ?: return "Atualização não informada"
+    val millis = if (vehicleTimestamp < 100_000_000_000L) vehicleTimestamp * 1_000 else vehicleTimestamp
+    return "Atualizado ${DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT).format(Date(millis))}" +
+        if (isStale()) " • posição desatualizada" else ""
+}
+
+private fun Context.hasLocationPermission(): Boolean =
+    checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
+        checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+
+private fun Location.toLatLng() = LatLng(latitude, longitude)
+
+private fun requestDeviceLocation(
+    client: com.google.android.gms.location.FusedLocationProviderClient,
+    onLocation: (Location) -> Unit,
+    onUnavailable: (String) -> Unit
+): CancellationTokenSource {
+    val token = CancellationTokenSource()
+    client.getCurrentLocation(Priority.PRIORITY_BALANCED_POWER_ACCURACY, token.token)
+        .addOnSuccessListener { location ->
+            if (location == null) onUnavailable("Não foi possível obter sua localização. Ative o GPS e tente novamente.")
+            else onLocation(location)
+        }
+        .addOnFailureListener { onUnavailable("Não foi possível obter sua localização. Verifique o GPS e tente novamente.") }
+    return token
+}

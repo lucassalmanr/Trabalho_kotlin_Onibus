@@ -26,7 +26,9 @@ class RoomAuthRepository(
         session.saveUser(user.id)
     }
 
-    override suspend fun logout() = session.clear()
+    override suspend fun logout() {
+        session.clear()
+    }
 
     private fun String.sha256(): String = MessageDigest.getInstance("SHA-256")
         .digest(toByteArray())

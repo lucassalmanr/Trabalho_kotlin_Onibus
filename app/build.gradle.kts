@@ -1,9 +1,18 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
     alias(libs.plugins.kotlin.serialization)
     alias(libs.plugins.ksp)
+}
+
+val localProperties = Properties().apply {
+    val localPropertiesFile = rootProject.file("local.properties")
+    if (localPropertiesFile.exists()) {
+        localPropertiesFile.inputStream().use { load(it) }
+    }
 }
 
 android {
@@ -16,6 +25,10 @@ android {
         targetSdk = 35
         versionCode = 1
         versionName = "1.0"
+        val mapsApiKey = localProperties.getProperty("MAPS_API_KEY").orEmpty()
+        val mobilibusAccessKey = localProperties.getProperty("MOBILIBUS_ACCESS_KEY").orEmpty()
+        manifestPlaceholders["MAPS_API_KEY"] = mapsApiKey
+        buildConfigField("String", "MOBILIBUS_ACCESS_KEY", "\"$mobilibusAccessKey\"")
     }
 
     buildFeatures { compose = true; buildConfig = true }
@@ -49,5 +62,9 @@ dependencies {
     implementation(libs.okhttp)
     implementation(libs.datastore.preferences)
     implementation(libs.kotlinx.serialization.json)
+    implementation(libs.gtfs.realtime.bindings)
+    implementation(libs.google.maps.compose)
+    implementation(libs.play.services.location)
+    testImplementation("junit:junit:4.13.2")
     debugImplementation(libs.androidx.compose.ui.tooling)
 }

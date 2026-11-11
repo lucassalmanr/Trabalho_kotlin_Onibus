@@ -1,5 +1,6 @@
 package br.com.mobilibus.tracker.ui
 
+import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
@@ -7,6 +8,7 @@ import br.com.mobilibus.tracker.domain.model.Vehicle
 import br.com.mobilibus.tracker.domain.repository.AuthRepository
 import br.com.mobilibus.tracker.domain.repository.FavoriteRepository
 import br.com.mobilibus.tracker.domain.repository.VehicleRepository
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -50,11 +52,16 @@ class TrackerViewModel(
 
     fun refresh() = viewModelScope.launch {
         _feed.value = FeedUiState.Loading
-        _feed.value = runCatching { vehicles.fetchVehicles() }
-            .fold(
-                onSuccess = { FeedUiState.Success(it.vehicles, it.fetchedAt) },
-                onFailure = { FeedUiState.Error(it.message ?: "Falha ao carregar os veículos.") }
-            )
+        try {
+            val result = vehicles.fetchVehicles()
+            Log.i(TAG, "Lista de veículos atualizada: ${result.vehicles.size} veículos")
+            _feed.value = FeedUiState.Success(result.vehicles, result.fetchedAt)
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            Log.e(TAG, "Falha ao atualizar a lista de veículos.", error)
+            _feed.value = FeedUiState.Error(error.message ?: "Falha ao carregar os veículos. Consulte o Logcat.")
+        }
     }
 
     fun toggleFavorite(vehicle: Vehicle, isFavorite: Boolean) = viewModelScope.launch {
@@ -62,6 +69,10 @@ class TrackerViewModel(
     }
 
     fun logout() = viewModelScope.launch { auth.logout() }
+
+    private companion object {
+        const val TAG = "MobilibusTracker"
+    }
 }
 
 @Suppress("UNCHECKED_CAST")

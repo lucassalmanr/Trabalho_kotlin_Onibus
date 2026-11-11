@@ -1,29 +1,52 @@
 package br.com.mobilibus.tracker.data.remote
 
+import android.util.Log
+import br.com.mobilibus.tracker.BuildConfig
 import br.com.mobilibus.tracker.domain.model.Vehicle
 import br.com.mobilibus.tracker.domain.model.VehicleFeed
 import br.com.mobilibus.tracker.domain.repository.VehicleRepository
+import com.google.transit.realtime.GtfsRealtime
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import okhttp3.ResponseBody
 import retrofit2.Retrofit
 import retrofit2.http.GET
 import retrofit2.http.Query
+import kotlin.math.roundToInt
 
 interface MobilibusService {
     @GET("web/4ch6j/vehicle-positions")
-    suspend fun vehiclePositions(@Query("accesskey") accessKey: String = ACCESS_KEY): ResponseBody
-
-    private companion object {
-        const val ACCESS_KEY = "982a57efd77a9462bf1665696fb25984"
-    }
+    suspend fun vehiclePositions(@Query("accesskey") accessKey: String): ResponseBody
 }
 
 class MobilibusVehicleRepository(private val service: MobilibusService) : VehicleRepository {
-    override suspend fun fetchVehicles(): VehicleFeed {
-        val bytes = service.vehiclePositions().use { response ->
-            check(response.contentLength() != 0L) { "A API retornou uma resposta vazia." }
-            response.bytes()
+    override suspend fun fetchVehicles(): VehicleFeed = withContext(Dispatchers.IO) {
+        try {
+            check(BuildConfig.MOBILIBUS_ACCESS_KEY.isNotBlank()) {
+                "A chave da API Mobilibus não foi configurada."
+            }
+            val bytes = service.vehiclePositions(BuildConfig.MOBILIBUS_ACCESS_KEY).use { response ->
+                Log.d(TAG, "Resposta recebida: tipo=${response.contentType()}, tamanho declarado=${response.contentLength()} bytes")
+                check(response.contentLength() != 0L) { "A API retornou uma resposta vazia." }
+                response.bytes().also { Log.d(TAG, "Corpo da resposta lido: ${it.size} bytes") }
+            }
+            val decoded = GtfsVehicleDecoder.decode(bytes)
+            check(decoded.vehicleEntities == 0 || decoded.vehicles.isNotEmpty()) {
+                "O feed contém ${decoded.vehicleEntities} veículos, mas nenhuma posição válida foi convertida. Consulte o Logcat."
+            }
+            Log.i(TAG, decoded.summary())
+            VehicleFeed(decoded.vehicles, System.currentTimeMillis())
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            Log.e(TAG, "Falha ao buscar ou decodificar o feed GTFS-Realtime.", error)
+            throw IllegalStateException("Não foi possível carregar as posições dos veículos. Consulte o Logcat.", error)
         }
-        return VehicleFeed(ProtoVehicleDecoder.decode(bytes), System.currentTimeMillis())
+    }
+
+    private companion object {
+        const val TAG = "MobilibusFeed"
     }
 }
 
@@ -35,116 +58,94 @@ object RemoteGraph {
     val vehicleRepository: VehicleRepository = MobilibusVehicleRepository(retrofit.create(MobilibusService::class.java))
 }
 
-/**
- * The endpoint replies with application/x-protobuf, not JSON. This small, defensive
- * reader supports the protobuf field types used by the public position feed.
- */
-object ProtoVehicleDecoder {
-    fun decode(bytes: ByteArray): List<Vehicle> = ProtoReader(bytes).fields
-        // Field 1 is feed metadata; each actual vehicle is a repeated field 2 message.
-        .filter { it.number == 2 && it.bytes != null }
-        .mapNotNull { runCatching { decodeEntry(it.bytes!!) }.getOrNull() }
-        .distinctBy { it.id }
-
-    private fun decodeEntry(bytes: ByteArray): Vehicle? {
-        val entry = ProtoReader(bytes).fields
-        val id = entry.string(1).orEmpty()
-        val payload = entry.message(2) ?: return null
-        val label = payload.string(1).orEmpty().ifBlank { id }
-        if (label.isBlank()) return null
-
-        val line = payload.string(5).orEmpty().ifBlank {
-            label.trim().substringBefore(' ').ifBlank { "Linha indisponível" }
-        }
-        val destinationMessage = payload.message(8)
-        val destination = destinationMessage?.printableStrings()?.lastOrNull()
-            ?: "Destino não informado"
-        val position = payload.messages(2)
-            .firstOrNull { it.fields.any { field -> field.fixed32 != null } }
-        val floats = position?.fields?.mapNotNull { it.floatValue } ?: emptyList()
-
-        return Vehicle(
-            id = id.ifBlank { "$line-$label" },
-            label = label,
-            line = line,
-            destination = destination,
-            latitude = floats.getOrNull(0)?.toDouble()?.takeIf { it in -90.0..90.0 },
-            longitude = floats.getOrNull(1)?.toDouble()?.takeIf { it in -180.0..180.0 },
-            speedKmh = floats.getOrNull(2)?.toInt()?.takeIf { it >= 0 },
-            timestamp = position?.fields?.firstOrNull { it.number == 5 }?.varint
-        )
-    }
-
-    private class ProtoReader(private val source: ByteArray) {
-        val fields: List<Field> = buildList {
-            var offset = 0
-            while (offset < source.size) {
-                val (tag, afterTag) = readVarint(source, offset) ?: break
-                offset = afterTag
-                val number = (tag shr 3).toInt()
-                when ((tag and 7).toInt()) {
-                    0 -> {
-                        val value = readVarint(source, offset) ?: break
-                        add(Field(number, varint = value.first)); offset = value.second
-                    }
-                    1 -> { if (offset + 8 > source.size) break; offset += 8 }
-                    2 -> {
-                        val length = readVarint(source, offset) ?: break
-                        offset = length.second
-                        val end = (offset + length.first.toInt()).coerceAtMost(source.size)
-                        add(Field(number, bytes = source.copyOfRange(offset, end))); offset = end
-                    }
-                    5 -> {
-                        if (offset + 4 > source.size) break
-                        val value = (source[offset].toInt() and 0xff) or
-                            ((source[offset + 1].toInt() and 0xff) shl 8) or
-                            ((source[offset + 2].toInt() and 0xff) shl 16) or
-                            ((source[offset + 3].toInt() and 0xff) shl 24)
-                        add(Field(number, fixed32 = value)); offset += 4
-                    }
-                    else -> break
-                }
-            }
-        }
-
-        fun string(number: Int): String? = fields.firstOrNull { it.number == number }?.bytes
-            ?.takeIf(::isPrintableText)?.toString(Charsets.UTF_8)
-
-        fun message(number: Int): ProtoReader? = fields.firstOrNull { it.number == number }?.bytes
-            ?.takeUnless(::isPrintableText)?.let(::ProtoReader)
-
-        fun messages(number: Int): List<ProtoReader> = fields.filter { it.number == number }
-            .mapNotNull { it.bytes?.takeUnless(::isPrintableText)?.let(::ProtoReader) }
-
-        fun printableStrings(): List<String> = fields.mapNotNull { field ->
-            field.bytes?.takeIf(::isPrintableText)?.toString(Charsets.UTF_8)
-        }
-    }
-
-    private data class Field(
-        val number: Int,
-        val varint: Long? = null,
-        val bytes: ByteArray? = null,
-        val fixed32: Int? = null
+/** Converts the official GTFS-Realtime schema to the app's domain model. */
+internal object GtfsVehicleDecoder {
+    data class DecodeResult(
+        val gtfsVersion: String,
+        val entities: Int,
+        val vehicleEntities: Int,
+        val vehicles: List<Vehicle>,
+        val deleted: Int,
+        val withoutVehicle: Int,
+        val withoutPosition: Int,
+        val invalidCoordinates: Int,
+        val missingId: Int
     ) {
-        val floatValue: Float? get() = fixed32?.let(Float::fromBits)
+        fun summary(): String =
+            "GTFS-RT versão=$gtfsVersion, entidades=$entities, veículos=$vehicleEntities, " +
+                "convertidos=${vehicles.size}, descartados: excluídos=$deleted, semVeículo=$withoutVehicle, " +
+                "semPosição=$withoutPosition, coordenadasInválidas=$invalidCoordinates, semId=$missingId"
     }
 
-    private fun isPrintableText(bytes: ByteArray): Boolean = bytes.isNotEmpty() && bytes.all {
-        val value = it.toInt() and 0xff
-        value == 9 || value == 10 || value == 13 || value >= 32
-    }
+    fun decode(bytes: ByteArray): DecodeResult = decode(GtfsRealtime.FeedMessage.parseFrom(bytes))
 
-    private fun readVarint(bytes: ByteArray, start: Int): Pair<Long, Int>? {
-        var result = 0L
-        var shift = 0
-        var offset = start
-        while (offset < bytes.size && shift < 64) {
-            val next = bytes[offset++].toInt() and 0xff
-            result = result or ((next and 0x7f).toLong() shl shift)
-            if (next and 0x80 == 0) return result to offset
-            shift += 7
+    fun decode(feed: GtfsRealtime.FeedMessage): DecodeResult {
+        val vehicles = mutableListOf<Vehicle>()
+        var vehicleEntities = 0
+        var deleted = 0
+        var withoutVehicle = 0
+        var withoutPosition = 0
+        var invalidCoordinates = 0
+        var missingId = 0
+
+        for (entity in feed.entityList) {
+            if (entity.isDeleted) {
+                deleted++
+                continue
+            }
+            if (!entity.hasVehicle()) {
+                withoutVehicle++
+                continue
+            }
+
+            vehicleEntities++
+            val vehiclePosition = entity.vehicle
+            if (!vehiclePosition.hasPosition()) {
+                withoutPosition++
+                continue
+            }
+
+            val position = vehiclePosition.position
+            val latitude = position.latitude.toDouble()
+            val longitude = position.longitude.toDouble()
+            if (!latitude.isFinite() || !longitude.isFinite() || latitude !in -90.0..90.0 || longitude !in -180.0..180.0) {
+                invalidCoordinates++
+                continue
+            }
+
+            val descriptor = vehiclePosition.vehicle
+            val id = descriptor.id.ifBlank { entity.id }.trim()
+            if (id.isBlank()) {
+                missingId++
+                continue
+            }
+
+            vehicles += Vehicle(
+                id = id,
+                label = descriptor.label.ifBlank { id },
+                line = vehiclePosition.trip.routeId.ifBlank { "Linha indisponível" },
+                destination = "Destino não informado",
+                latitude = latitude,
+                longitude = longitude,
+                speedKmh = position.takeIf { it.hasSpeed() }
+                    ?.speed
+                    ?.takeIf { it.isFinite() && it >= 0f }
+                    ?.times(3.6f)
+                    ?.roundToInt(),
+                timestamp = vehiclePosition.takeIf { it.hasTimestamp() }?.timestamp
+            )
         }
-        return null
+
+        return DecodeResult(
+            gtfsVersion = feed.header.gtfsRealtimeVersion,
+            entities = feed.entityCount,
+            vehicleEntities = vehicleEntities,
+            vehicles = vehicles.distinctBy { it.id },
+            deleted = deleted,
+            withoutVehicle = withoutVehicle,
+            withoutPosition = withoutPosition,
+            invalidCoordinates = invalidCoordinates,
+            missingId = missingId
+        )
     }
 }
